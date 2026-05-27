@@ -126,12 +126,21 @@ def v2():
             self._nixl = MagicMock()
             self._agent_name = kw.get("agent_name", "stub")
             self._worker_id = "stub-worker"
+            # Tests inject scratch payloads via this dict: worker_id → {name: tensor}.
+            self._scratch_payloads: dict[str, dict[str, Any]] = {}
 
         def initialize(self, model_tensors=None):
             pass
 
         def receive_weights(self, ref, timeout_seconds=300.0):
             return iter([])
+
+        def receive_weights_scratch(
+            self, ref, timeout_seconds=300.0, tensor_shapes=None
+        ):
+            payload = self._scratch_payloads.get(ref.worker_id, {})
+            for name, tensor in payload.items():
+                yield name, tensor
 
     refit_mod.MxRefitReceiver = _RefitStub
     refit_mod.SourceRef = _SourceRef
@@ -467,3 +476,483 @@ def test_agent_name_fallback_when_identity_missing(v2):
     assert cand.worker_rank == 2
     assert cand.ref.training_step == 42
     assert cand.updated_at == 12345
+
+
+# ----------------------------------------------------------------------------
+# Phase 3b — compile_target_filter on discover_v2_sources
+# ----------------------------------------------------------------------------
+
+
+def _registry_blob(v2, tensors):
+    """Helper: encode a registry from a list of TensorDescriptorV2 dicts."""
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    descriptors = [
+        sd.TensorDescriptorV2(
+            name=t["name"],
+            global_shape=t.get("global_shape", (8, 16)),
+            dtype=t.get("dtype", "bfloat16"),
+            placement_kind=t.get("placement_kind", sd.PLACEMENT_REPLICATE),
+            shard_axis=t.get("shard_axis", 0),
+            local_shard_range=t.get("local_shard_range"),
+            compile_target=t.get("compile_target", sd.COMPILE_TARGET_HF_RAW),
+            compile_metadata=t.get("compile_metadata", {}),
+        )
+        for t in tensors
+    ]
+    return sd.encode_registry(descriptors, version=1, trainer_world_layout="fsdp:1")
+
+
+def _set_two_compile_sources(v2, receiver, hf_blob, fp8_blob):
+    response = MagicMock()
+    response.instances = [
+        _fake_instance("m", "s", "trainer_hf"),
+        _fake_instance("m", "s", "trainer_fp8"),
+    ]
+    metas = {
+        "trainer_hf": _fake_meta("trainer", 0, 7, 200, registry_blob=hf_blob),
+        "trainer_fp8": _fake_meta("trainer", 0, 7, 300, registry_blob=fp8_blob),
+    }
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = lambda mx_source_id, worker_id: metas[worker_id]
+
+
+def test_compile_target_filter_accepts_only_matching(v2):
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+
+    hf_blob = _registry_blob(v2, [{"name": "w"}])
+    fp8_blob = _registry_blob(
+        v2,
+        [{"name": "w", "compile_target": sd.COMPILE_TARGET_DEEPGEMM_FP8}],
+    )
+    _set_two_compile_sources(v2, receiver, hf_blob, fp8_blob)
+
+    only_hf = receiver.discover_v2_sources(
+        model_name="m",
+        min_version=0,
+        compile_target_filter={sd.COMPILE_TARGET_HF_RAW},
+    )
+    assert [c.ref.worker_id for c in only_hf] == ["trainer_hf"]
+
+    only_fp8 = receiver.discover_v2_sources(
+        model_name="m",
+        min_version=0,
+        compile_target_filter={sd.COMPILE_TARGET_DEEPGEMM_FP8},
+    )
+    assert [c.ref.worker_id for c in only_fp8] == ["trainer_fp8"]
+
+    both = receiver.discover_v2_sources(
+        model_name="m",
+        min_version=0,
+        compile_target_filter={
+            sd.COMPILE_TARGET_HF_RAW,
+            sd.COMPILE_TARGET_DEEPGEMM_FP8,
+        },
+    )
+    assert {c.ref.worker_id for c in both} == {"trainer_hf", "trainer_fp8"}
+
+
+def test_compile_target_filter_unset_admits_all(v2):
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+
+    hf_blob = _registry_blob(v2, [{"name": "w"}])
+    fp8_blob = _registry_blob(
+        v2,
+        [{"name": "w", "compile_target": sd.COMPILE_TARGET_DEEPGEMM_FP8}],
+    )
+    _set_two_compile_sources(v2, receiver, hf_blob, fp8_blob)
+
+    out = receiver.discover_v2_sources(model_name="m", min_version=0)
+    assert {c.ref.worker_id for c in out} == {"trainer_hf", "trainer_fp8"}
+
+
+def test_compile_target_filter_rejects_when_no_registry(v2):
+    """If the candidate has no registry but caller wants compile filtering,
+    we MUST reject (we can't certify the bytes blindly)."""
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+
+    response = MagicMock()
+    response.instances = [_fake_instance("m", "s", "no_registry")]
+    metas = {
+        "no_registry": _fake_meta("trainer", 0, 1, 100, registry_blob=""),
+    }
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = lambda mx_source_id, worker_id: metas[worker_id]
+
+    # With no filter, candidate is admitted (back-compat).
+    assert len(receiver.discover_v2_sources(model_name="m")) == 1
+    # With a filter, candidate is rejected (no registry → unknowable target).
+    filtered = receiver.discover_v2_sources(
+        model_name="m",
+        compile_target_filter={sd.COMPILE_TARGET_HF_RAW},
+    )
+    assert filtered == []
+
+
+def test_compile_target_filter_required_metadata(v2):
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+
+    blob128 = _registry_blob(
+        v2,
+        [{
+            "name": "w",
+            "compile_target": sd.COMPILE_TARGET_DEEPGEMM_FP8,
+            "compile_metadata": {"block_size": 128},
+        }],
+    )
+    blob256 = _registry_blob(
+        v2,
+        [{
+            "name": "w",
+            "compile_target": sd.COMPILE_TARGET_DEEPGEMM_FP8,
+            "compile_metadata": {"block_size": 256},
+        }],
+    )
+    response = MagicMock()
+    response.instances = [
+        _fake_instance("m", "s", "blk128"),
+        _fake_instance("m", "s", "blk256"),
+    ]
+    metas = {
+        "blk128": _fake_meta("trainer", 0, 1, 100, registry_blob=blob128),
+        "blk256": _fake_meta("trainer", 0, 1, 200, registry_blob=blob256),
+    }
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = lambda mx_source_id, worker_id: metas[worker_id]
+
+    keep_128 = receiver.discover_v2_sources(
+        model_name="m",
+        compile_target_filter={sd.COMPILE_TARGET_DEEPGEMM_FP8},
+        required_compile_metadata={"block_size": 128},
+    )
+    assert [c.ref.worker_id for c in keep_128] == ["blk128"]
+
+
+# ----------------------------------------------------------------------------
+# Phase 4 — multi-source slice discovery (discover_v2_sources_for_slice)
+# ----------------------------------------------------------------------------
+
+
+def _build_two_trainers_tp4_mixed_tp8(v2):
+    """Two trainers at TP=4: rank 0 holds rows [0,2048), rank 1 holds [2048,4096)
+    on a tensor of global axis-0 extent 4096. Receiver at TP=8 rank N wants
+    rows [N*512, (N+1)*512)."""
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    blob_r0 = _registry_blob(
+        v2,
+        [{
+            "name": "w",
+            "global_shape": (4096, 1024),
+            "placement_kind": sd.PLACEMENT_SHARD,
+            "shard_axis": 0,
+            "local_shard_range": (0, 2048),
+        }],
+    )
+    blob_r1 = _registry_blob(
+        v2,
+        [{
+            "name": "w",
+            "global_shape": (4096, 1024),
+            "placement_kind": sd.PLACEMENT_SHARD,
+            "shard_axis": 0,
+            "local_shard_range": (2048, 4096),
+        }],
+    )
+    return blob_r0, blob_r1
+
+
+def _set_two_trainers(v2, receiver, blob_r0, blob_r1):
+    response = MagicMock()
+    response.instances = [
+        _fake_instance("m", "s", "trainer_r0"),
+        _fake_instance("m", "s", "trainer_r1"),
+    ]
+    metas = {
+        "trainer_r0": _fake_meta("trainer", 0, 7, 200, registry_blob=blob_r0),
+        "trainer_r1": _fake_meta("trainer", 1, 7, 200, registry_blob=blob_r1),
+    }
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = lambda mx_source_id, worker_id: metas[worker_id]
+
+
+def test_phase4_slice_within_one_trainer_shard(v2):
+    """Receiver TP=8 rank=1 wants rows [512, 1024) — fully inside trainer rank 0."""
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=1
+    )
+    receiver.initialize()
+    blob_r0, blob_r1 = _build_two_trainers_tp4_mixed_tp8(v2)
+    _set_two_trainers(v2, receiver, blob_r0, blob_r1)
+
+    plan = receiver.discover_v2_sources_for_slice(
+        model_name="m",
+        target_layout=v2.TargetTPLayout(world_size=8, rank=1, shard_axis=0),
+        same_rank_only=False,
+    )
+    assert plan.fully_covered
+    contributions = plan.per_tensor_sources["w"]
+    assert len(contributions) == 1
+    src = contributions[0]
+    assert src.candidate.ref.worker_id == "trainer_r0"
+    assert src.src_range == (512, 1024)
+    assert src.dst_range == (0, 512)
+
+
+def test_phase4_slice_spans_two_trainer_shards(v2):
+    """Receiver TP=2 rank=0 wants [0, 2048) — exactly trainer rank 0 alone.
+    Receiver TP=2 rank=1 wants [2048, 4096) — exactly trainer rank 1 alone.
+    Now flip: receiver TP=4 rank=1 wants [1024, 2048) — split case stays inside
+    trainer rank 0.  Real cross-shard case: receiver TP=2 wants exact halves
+    (use a receiver that explicitly straddles the boundary)."""
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+    blob_r0, blob_r1 = _build_two_trainers_tp4_mixed_tp8(v2)
+    _set_two_trainers(v2, receiver, blob_r0, blob_r1)
+
+    # target_range=(1500, 2500) straddles the trainer rank 0/1 boundary at 2048.
+    plan = receiver.discover_v2_sources_for_slice(
+        model_name="m",
+        target_layout=v2.TargetTPLayout(
+            world_size=1, rank=0, shard_axis=0, target_range=(1500, 2500)
+        ),
+        same_rank_only=False,
+    )
+    assert plan.fully_covered
+    contributions = plan.per_tensor_sources["w"]
+    assert len(contributions) == 2
+    # First contribution from trainer rank 0: [1500, 2048) in src → [0, 548) in dst
+    first = contributions[0]
+    assert first.candidate.ref.worker_id == "trainer_r0"
+    assert first.src_range == (1500, 2048)
+    assert first.dst_range == (0, 548)
+    # Second contribution from trainer rank 1: [0, 452) in src → [548, 1000) in dst
+    second = contributions[1]
+    assert second.candidate.ref.worker_id == "trainer_r1"
+    assert second.src_range == (0, 452)
+    assert second.dst_range == (548, 1000)
+
+
+def test_phase4_replicate_picks_one_candidate(v2):
+    """REPLICATE tensor: any candidate works; planner picks the freshest one."""
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+
+    blob = _registry_blob(
+        v2,
+        [{"name": "lm_head.weight", "global_shape": (1024, 4096), "placement_kind": sd.PLACEMENT_REPLICATE}],
+    )
+    response = MagicMock()
+    response.instances = [
+        _fake_instance("m", "s", "trainer_a"),
+        _fake_instance("m", "s", "trainer_b"),
+    ]
+    metas = {
+        "trainer_a": _fake_meta("trainer", 0, 7, 100, registry_blob=blob),
+        "trainer_b": _fake_meta("trainer", 1, 7, 300, registry_blob=blob),
+    }
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = lambda mx_source_id, worker_id: metas[worker_id]
+
+    plan = receiver.discover_v2_sources_for_slice(
+        model_name="m",
+        target_layout=v2.TargetTPLayout(world_size=2, rank=0, shard_axis=0),
+        same_rank_only=False,
+    )
+    assert plan.fully_covered
+    contribs = plan.per_tensor_sources["lm_head.weight"]
+    assert len(contribs) == 1
+    # Freshest trainer (updated_at=300) preferred; either trainer is correct, but
+    # the picker sorts by freshness so trainer_b wins.
+    assert contribs[0].candidate.ref.worker_id == "trainer_b"
+
+
+def test_phase4_coverage_gap_is_missing(v2):
+    """If trainers don't fully cover the receiver's slice, plan.missing fires."""
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+    # Single trainer with [0, 1024); receiver wants [0, 4096).
+    blob = _registry_blob(
+        v2,
+        [{
+            "name": "w",
+            "global_shape": (4096,),
+            "placement_kind": sd.PLACEMENT_SHARD,
+            "shard_axis": 0,
+            "local_shard_range": (0, 1024),
+        }],
+    )
+    response = MagicMock()
+    response.instances = [_fake_instance("m", "s", "only_one")]
+    metas = {"only_one": _fake_meta("trainer", 0, 7, 200, registry_blob=blob)}
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = lambda mx_source_id, worker_id: metas[worker_id]
+
+    plan = receiver.discover_v2_sources_for_slice(
+        model_name="m",
+        target_layout=v2.TargetTPLayout(
+            world_size=1, rank=0, shard_axis=0, target_range=(0, 4096)
+        ),
+        same_rank_only=False,
+    )
+    assert not plan.fully_covered
+    assert plan.missing
+    assert "coverage gap" in plan.missing[0]
+
+
+def test_phase4_shard_axis_mismatch_is_missing(v2):
+    """Publisher shards on axis 0 but receiver wants axis 1: caller's problem."""
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+    blob = _registry_blob(
+        v2,
+        [{
+            "name": "w",
+            "global_shape": (4096, 1024),
+            "placement_kind": sd.PLACEMENT_SHARD,
+            "shard_axis": 0,
+            "local_shard_range": (0, 4096),
+        }],
+    )
+    response = MagicMock()
+    response.instances = [_fake_instance("m", "s", "trainer")]
+    metas = {"trainer": _fake_meta("trainer", 0, 7, 200, registry_blob=blob)}
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = lambda mx_source_id, worker_id: metas[worker_id]
+
+    plan = receiver.discover_v2_sources_for_slice(
+        model_name="m",
+        target_layout=v2.TargetTPLayout(
+            world_size=2, rank=0, shard_axis=1, target_range=(0, 512)
+        ),
+        same_rank_only=False,
+    )
+    assert not plan.fully_covered
+    assert any("shard_axis mismatch" in m for m in plan.missing)
+
+
+def test_phase4_receive_via_plan_stitches_two_sources(v2):
+    """End-to-end: planner + receive_via_plan correctly stitches two shards."""
+    import torch
+
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+    blob_r0, blob_r1 = _build_two_trainers_tp4_mixed_tp8(v2)
+    _set_two_trainers(v2, receiver, blob_r0, blob_r1)
+
+    # Build fake scratch tensors that match what the publishers would expose:
+    # trainer r0 owns [0, 2048), trainer r1 owns [2048, 4096). Each is a
+    # (local_extent, 1024) bf16 tensor (we'd actually be returning floats here
+    # so the in-process slice/cat math is observable).
+    r0_buf = torch.arange(0, 2048).repeat_interleave(1024).view(2048, 1024).float()
+    r1_buf = torch.arange(2048, 4096).repeat_interleave(1024).view(2048, 1024).float()
+    receiver._receiver._scratch_payloads = {
+        "trainer_r0": {"w": r0_buf},
+        "trainer_r1": {"w": r1_buf},
+    }
+
+    plan = receiver.discover_v2_sources_for_slice(
+        model_name="m",
+        target_layout=v2.TargetTPLayout(
+            world_size=1, rank=0, shard_axis=0, target_range=(1500, 2500)
+        ),
+        same_rank_only=False,
+    )
+    assert plan.fully_covered
+
+    out = dict(receiver.receive_via_plan(plan))
+    assert "w" in out
+    stitched = out["w"]
+    # Expect shape (1000, 1024); first 548 rows come from r0_buf[1500:2048],
+    # next 452 rows come from r1_buf[0:452] (which are global rows [2048,2500)).
+    assert stitched.shape == (1000, 1024)
+    expected = torch.cat([r0_buf[1500:2048], r1_buf[0:452]], dim=0)
+    assert torch.equal(stitched, expected)
+
+
+def test_phase4_receive_via_plan_single_source_passthrough(v2):
+    """When one trainer covers the slice, no torch.cat happens."""
+    import torch
+
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=1
+    )
+    receiver.initialize()
+    blob_r0, blob_r1 = _build_two_trainers_tp4_mixed_tp8(v2)
+    _set_two_trainers(v2, receiver, blob_r0, blob_r1)
+
+    r0_buf = torch.arange(0, 2048).repeat_interleave(1024).view(2048, 1024).float()
+    receiver._receiver._scratch_payloads = {"trainer_r0": {"w": r0_buf}}
+
+    # Receiver TP=8 rank=1: wants rows [512, 1024) — fully inside trainer r0.
+    plan = receiver.discover_v2_sources_for_slice(
+        model_name="m",
+        target_layout=v2.TargetTPLayout(world_size=8, rank=1, shard_axis=0),
+        same_rank_only=False,
+    )
+    assert plan.fully_covered
+    out = dict(receiver.receive_via_plan(plan))
+    assert out["w"].shape == (512, 1024)
+    assert torch.equal(out["w"], r0_buf[512:1024])
+
+
+def test_phase4_receive_via_plan_rejects_uncovered(v2):
+    """receive_via_plan refuses to run a partial plan."""
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+    blob = _registry_blob(
+        v2,
+        [{
+            "name": "w",
+            "global_shape": (4096,),
+            "placement_kind": sd.PLACEMENT_SHARD,
+            "shard_axis": 0,
+            "local_shard_range": (0, 1024),
+        }],
+    )
+    response = MagicMock()
+    response.instances = [_fake_instance("m", "s", "only_one")]
+    metas = {"only_one": _fake_meta("trainer", 0, 7, 200, registry_blob=blob)}
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = lambda mx_source_id, worker_id: metas[worker_id]
+
+    plan = receiver.discover_v2_sources_for_slice(
+        model_name="m",
+        target_layout=v2.TargetTPLayout(
+            world_size=1, rank=0, shard_axis=0, target_range=(0, 4096)
+        ),
+        same_rank_only=False,
+    )
+    with pytest.raises(RuntimeError, match="not fully covered"):
+        list(receiver.receive_via_plan(plan))

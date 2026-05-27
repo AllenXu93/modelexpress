@@ -48,8 +48,10 @@ from . import p2p_pb2
 from .metadata.heartbeat import HeartbeatThread
 from .refit_receiver import MxRefitReceiver, SourceRef
 from .shape_descriptors import (
+    COMPILE_TARGET_HF_RAW,
     PLACEMENT_SHARD,
     TensorDescriptorV2,
+    compile_target_matches,
     decode_expert_set,
     decode_registry,
     describe_tensor,
@@ -66,6 +68,25 @@ logger = logging.getLogger("modelexpress.nemo_rl_v2")
 ROLE_TRAINER = "trainer"
 ROLE_INFERENCE = "inference"
 ROLE_INFERENCE_REPLICA = "inference_replica"
+
+
+def _slice_along_axis(
+    tensor: torch.Tensor, axis: int, rng: tuple[int, int]
+) -> torch.Tensor:
+    """View ``tensor[..., rng[0]:rng[1], ...]`` along ``axis``.
+
+    Phase-4 helper: lifts a publisher's local-shard bytes into the
+    receiver's destination slice. Returns a view (no copy) when ``tensor``
+    is already contiguous along ``axis``; otherwise yields a contiguous
+    clone so subsequent ``torch.cat`` is well-defined.
+    """
+    start, end = rng
+    if tensor.ndim == 0 or start == 0 and end == tensor.shape[axis]:
+        return tensor
+    idx: list[slice] = [slice(None)] * tensor.ndim
+    idx[axis] = slice(start, end)
+    out = tensor[tuple(idx)]
+    return out.contiguous() if not out.is_contiguous() else out
 
 
 # Synthetic tensor descriptor used as a v2 metadata sidecar. The current
@@ -370,7 +391,19 @@ class MxV2TrainingPublisher:
 
 @dataclass
 class V2SourceCandidate:
-    """A discovered source with v2 metadata parsed."""
+    """A discovered source with v2 metadata parsed.
+
+    ``compile_targets`` is the set of distinct ``TensorDescriptorV2.compile_target``
+    values present across the candidate's registry. A receiver filters on this
+    via :meth:`MxV2RefitReceiver.discover_v2_sources` (``compile_target_filter=``).
+    The most common shapes:
+
+    - ``{"hf_raw"}`` — clean HF state-dict bytes; any kernel-aware receiver
+      can compile from it.
+    - ``{"deep_gemm_fp8"}`` — already quantised + reordered for DeepGemm.
+    - ``{"hf_raw", "deep_gemm_fp8"}`` — mixed: some tensors raw, some compiled
+      (rare but legal; receivers must check per-tensor).
+    """
 
     ref: SourceRef
     role: str  # "trainer" | "inference_replica"
@@ -378,6 +411,90 @@ class V2SourceCandidate:
     registry: dict | None  # decoded registry; None for inference_replica
     owned_experts_per_layer: dict[int, set[int]]  # layer_idx → expert IDs
     updated_at: int  # ms epoch
+    compile_targets: frozenset[str] = frozenset({COMPILE_TARGET_HF_RAW})
+
+
+@dataclass
+class TargetTPLayout:
+    """What slice of the global tensor a Phase-4 receiver wants.
+
+    Phase 4 (mixed-TP / multi-source slice discovery, see post-#2389 RFC §5).
+    A receiver running at inference-time describes its local view by:
+
+      - ``world_size``: the inference-side world that's splitting the tensor
+        (e.g. inference TP=8 even if trainer was TP=4).
+      - ``rank``: this receiver's rank within ``world_size``. Used to compute
+        an even slice by default.
+      - ``shard_axis``: which tensor axis is sharded across that world.
+      - ``target_range``: optional explicit ``(start, end)`` along
+        ``shard_axis`` to override the default even-split math. Necessary
+        for uneven layouts (e.g. expert sharding with custom owner maps).
+
+    The publisher's ``placement_kind`` + ``local_shard_range`` are looked up
+    per tensor; the planner intersects ``target_range`` against every
+    publisher slice and emits the minimal candidate set.
+    """
+
+    world_size: int
+    rank: int
+    shard_axis: int = 0
+    target_range: tuple[int, int] | None = None
+
+
+@dataclass
+class SliceSource:
+    """One source contribution toward filling a receiver's target slice.
+
+    Emitted by :class:`SliceCoveragePlan`. The receiver issues one NIXL
+    RDMA read per ``SliceSource``, copying ``src_range`` bytes from the
+    candidate's buffer into ``dst_range`` of the local destination.
+    """
+
+    candidate: V2SourceCandidate
+    tensor_name: str
+    src_range: tuple[int, int]
+    dst_range: tuple[int, int]
+    shard_axis: int
+
+
+@dataclass
+class _TensorPlan:
+    """Internal: result of planning one tensor's coverage."""
+
+    contributions: list[SliceSource]
+    reason: str
+
+
+@dataclass
+class SliceCoveragePlan:
+    """Result of :meth:`MxV2RefitReceiver.discover_v2_sources_for_slice`.
+
+    Fields:
+        candidates: every v2 candidate that passed the filter.
+        per_tensor_sources: per-tensor list of :class:`SliceSource`
+            describing how to fill that tensor's target slice. An empty
+            entry means no plan was found (see ``missing``).
+        missing: list of ``"name: reason"`` for tensors that couldn't be
+            fully covered. If non-empty, the receiver should treat the
+            plan as failed.
+        target_layout: echoed back for convenience.
+        legacy_single_source: True iff the picker found candidates but
+            none carried a v2 registry — in that case ``per_tensor_sources``
+            is empty and the caller should fall back to
+            :meth:`MxV2RefitReceiver.receive_from` with ``candidates[0]``.
+    """
+
+    candidates: list[V2SourceCandidate]
+    per_tensor_sources: dict[str, list[SliceSource]]
+    missing: list[str]
+    target_layout: TargetTPLayout
+    legacy_single_source: bool = False
+
+    @property
+    def fully_covered(self) -> bool:
+        return not self.missing and (
+            self.legacy_single_source or bool(self.per_tensor_sources)
+        )
 
 
 class MxV2RefitReceiver:
@@ -448,6 +565,8 @@ class MxV2RefitReceiver:
         min_version: int = 0,
         same_rank_only: bool = True,
         include_replicas: bool = True,
+        compile_target_filter: set[str] | frozenset[str] | None = None,
+        required_compile_metadata: dict[str, object] | None = None,
     ) -> list[V2SourceCandidate]:
         """List candidate v2 sources, filtering and sorting per the v2 rules.
 
@@ -461,6 +580,15 @@ class MxV2RefitReceiver:
                 have already received and republished. Combined with
                 ``same_rank_only``, this means "same-rank trainer + any
                 same-rank inference replica".
+            compile_target_filter: receiver-side whitelist of acceptable
+                ``compile_target`` strings. A candidate is admitted only if
+                *every* tensor in its registry has a compile_target in this
+                set (mixed-layout candidates are rejected — see RFC §5).
+                ``None`` (default) accepts everything, matching pre-Phase-3
+                behaviour.
+            required_compile_metadata: optional kv pairs that every tensor's
+                ``compile_metadata`` must match. Use for pinning block sizes,
+                scale layouts, kernel versions, etc.
 
         Returns:
             Candidates sorted by freshness (largest ``updated_at`` first).
@@ -565,6 +693,55 @@ class MxV2RefitReceiver:
             registry_blob = extra.get("shape_registry", "")
             registry = decode_registry(registry_blob) if registry_blob else None
 
+            # Phase 3b: enforce compile_target_filter / required_compile_metadata.
+            # We require ALL tensors in the registry to match — partial matches
+            # would mean the receiver consumes some bytes correctly and silently
+            # corrupts others. If the candidate has no registry (e.g. v0 trainer
+            # or an inference replica that didn't republish a registry), we
+            # admit it only when no filter is set, so callers explicitly opt in
+            # to compile-aware behaviour.
+            descriptors = [
+                t
+                for t in (registry["tensors"] if registry else [])
+                if isinstance(t, TensorDescriptorV2)
+            ]
+            if compile_target_filter is not None or required_compile_metadata:
+                if not descriptors:
+                    logger.debug(
+                        "skipping candidate worker_id=%s: compile filter set "
+                        "but candidate has no v2 registry",
+                        instance.worker_id,
+                    )
+                    continue
+                allowed = (
+                    frozenset(compile_target_filter)
+                    if compile_target_filter is not None
+                    else None
+                )
+                ok = all(
+                    compile_target_matches(
+                        d,
+                        allowed_targets=allowed,
+                        required_metadata=required_compile_metadata,
+                    )
+                    for d in descriptors
+                )
+                if not ok:
+                    logger.debug(
+                        "skipping candidate worker_id=%s: compile filter mismatch "
+                        "(targets=%s, want=%s)",
+                        instance.worker_id,
+                        sorted({d.compile_target for d in descriptors}),
+                        sorted(compile_target_filter) if compile_target_filter else "*",
+                    )
+                    continue
+
+            compile_targets = (
+                frozenset(d.compile_target for d in descriptors)
+                if descriptors
+                else frozenset({COMPILE_TARGET_HF_RAW})
+            )
+
             owned_blob = extra.get("owned_experts_per_layer", "")
             owned_experts_per_layer: dict[int, set[int]] = {}
             if owned_blob:
@@ -593,6 +770,7 @@ class MxV2RefitReceiver:
                     registry=registry,
                     owned_experts_per_layer=owned_experts_per_layer,
                     updated_at=updated_at,
+                    compile_targets=compile_targets,
                 )
             )
 
@@ -650,6 +828,314 @@ class MxV2RefitReceiver:
         yield from self._receiver.receive_weights(
             candidate.ref, timeout_seconds=timeout_seconds
         )
+
+    def receive_via_plan(
+        self,
+        plan: "SliceCoveragePlan",
+        *,
+        timeout_seconds: float = 300.0,
+        tensor_shapes: dict[str, tuple[int, ...]] | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Multi-source receive driven by a :class:`SliceCoveragePlan` (Phase 4).
+
+        For each candidate in the plan, issue a scratch RDMA receive and
+        copy the publisher's bytes into the receiver-local slice given by
+        ``SliceSource.dst_range``. Yields one ``(name, tensor)`` per tensor
+        in the plan, where ``tensor`` is the stitched view of the
+        receiver's requested slice.
+
+        **v0 caveats** (intentional, see post-#2389 RFC §5):
+
+        1. We issue one full ``receive_weights_scratch`` per contributing
+           candidate. If the publisher's local shard is larger than the
+           receiver's slice (the common case for trainer-TP=4 → inference-TP=8),
+           this transfers more bytes than strictly necessary. Phase 4.5 will
+           push a byte-offset/byte-length argument into the NIXL transfer
+           manager so we issue partial reads.
+
+        2. We do an in-process ``torch.cat`` along ``shard_axis`` to stitch
+           the contributions. For 2 contributions this is one extra D2D copy
+           per tensor; for N=4+ it would warrant a fused kernel. v0 doesn't
+           bother.
+
+        3. Falls back to single-source :meth:`receive_from` if
+           ``plan.legacy_single_source`` is True (no v2 registry on any
+           candidate, e.g. talking to a v1-only deployment).
+        """
+        if not plan.fully_covered:
+            raise RuntimeError(
+                f"plan is not fully covered; missing={plan.missing}"
+            )
+        if plan.legacy_single_source:
+            if not plan.candidates:
+                raise RuntimeError("legacy_single_source plan has no candidates")
+            yield from self.receive_from(
+                plan.candidates[0], timeout_seconds=timeout_seconds
+            )
+            return
+
+        # Walk contributing candidates; cache scratch results so we only
+        # issue one RDMA pull per candidate even if several tensors share it.
+        cand_to_scratch: dict[str, dict[str, torch.Tensor]] = {}
+        for tensor_name, contributions in plan.per_tensor_sources.items():
+            for src in contributions:
+                key = src.candidate.ref.worker_id
+                if key in cand_to_scratch:
+                    continue
+                scratch = {
+                    name: tensor
+                    for name, tensor in self._receiver.receive_weights_scratch(
+                        src.candidate.ref,
+                        timeout_seconds=timeout_seconds,
+                        tensor_shapes=tensor_shapes,
+                    )
+                }
+                cand_to_scratch[key] = scratch
+
+        for tensor_name, contributions in plan.per_tensor_sources.items():
+            # If a single contribution covers the slice, no stitching needed.
+            if len(contributions) == 1:
+                src = contributions[0]
+                buf = cand_to_scratch[src.candidate.ref.worker_id][tensor_name]
+                yield tensor_name, _slice_along_axis(
+                    buf, src.shard_axis, src.src_range
+                )
+                continue
+
+            slices = []
+            for src in contributions:
+                buf = cand_to_scratch[src.candidate.ref.worker_id][tensor_name]
+                slices.append(_slice_along_axis(buf, src.shard_axis, src.src_range))
+            stitched = torch.cat(slices, dim=contributions[0].shard_axis)
+            yield tensor_name, stitched
+
+    def discover_v2_sources_for_slice(
+        self,
+        *,
+        model_name: str,
+        target_layout: "TargetTPLayout",
+        min_version: int = 0,
+        same_rank_only: bool = False,
+        include_replicas: bool = True,
+        compile_target_filter: set[str] | frozenset[str] | None = None,
+        required_compile_metadata: dict[str, object] | None = None,
+    ) -> "SliceCoveragePlan":
+        """Phase-4 multi-source picker: returns the minimal candidate set covering ``target_layout``.
+
+        This is the entry point for **mixed-TP** receivers. The receiver
+        states the slice it wants (``target_layout`` describes its own TP
+        world size, this rank's TP rank, and which axis is the shard axis),
+        and we walk all v2 candidates to find the smallest set whose union
+        of ``local_shard_range`` covers that slice — *per tensor*.
+
+        Unlike :meth:`discover_v2_sources`, ``same_rank_only`` defaults to
+        ``False`` here: with mixed-TP the obvious case is "trainer TP=4,
+        inference TP=8, so each inference rank pulls from one or two trainer
+        ranks", which inherently requires reading across publisher ranks.
+
+        Returns a :class:`SliceCoveragePlan` whose ``per_tensor_sources`` maps
+        tensor name → ordered list of ``(candidate, src_range, dst_range)``
+        slice descriptors. If any tensor cannot be fully covered, the plan's
+        ``missing`` list is non-empty and the caller should error out.
+        """
+        if not self._initialized:
+            raise RuntimeError(
+                "call initialize() before discover_v2_sources_for_slice()"
+            )
+
+        candidates = self.discover_v2_sources(
+            model_name=model_name,
+            min_version=min_version,
+            same_rank_only=same_rank_only,
+            include_replicas=include_replicas,
+            compile_target_filter=compile_target_filter,
+            required_compile_metadata=required_compile_metadata,
+        )
+
+        per_tensor_sources: dict[str, list[SliceSource]] = {}
+        missing: list[str] = []
+        covered_tensors: set[str] = set()
+
+        # Aggregate candidates by tensor name. A tensor is "covered" when the
+        # union of admitted candidates' local_shard_ranges (on the requested
+        # shard_axis) contains the target slice.
+        all_tensor_names: set[str] = set()
+        for cand in candidates:
+            if not cand.registry:
+                continue
+            for td in cand.registry.get("tensors", []):
+                if isinstance(td, TensorDescriptorV2):
+                    all_tensor_names.add(td.name)
+
+        for name in sorted(all_tensor_names):
+            # Per-tensor slice planning. Use the candidate's per-tensor
+            # global_shape + placement_kind to decide what THIS receiver needs.
+            #
+            # Slice math is intentionally simple in v0:
+            #   - REPLICATE: any candidate provides the full bytes. Pick freshest.
+            #   - SHARD on axis A == target_layout.shard_axis: receiver's slice
+            #     is [target_start, target_end) over the global axis-A extent;
+            #     we accumulate candidates whose local_shard_range intersects
+            #     this slice, clipping each contribution to the wanted range.
+            #   - SHARD on a different axis: not handled in v0 — emit a missing
+            #     entry with a precise reason so the caller can fall back.
+            #   - PARTIAL: not handled in v0.
+            chosen = self._plan_tensor_slice(
+                name=name,
+                candidates=candidates,
+                target_layout=target_layout,
+            )
+            if chosen.contributions:
+                per_tensor_sources[name] = chosen.contributions
+                covered_tensors.add(name)
+            else:
+                missing.append(f"{name}: {chosen.reason}")
+
+        # If the registry of every candidate is empty (e.g. transport drop) we
+        # should still produce a plan with one default contribution per
+        # candidate so single-source receivers behave the same way they used
+        # to. Detect that legacy mode.
+        legacy_mode = not all_tensor_names and candidates
+        if legacy_mode:
+            return SliceCoveragePlan(
+                candidates=candidates,
+                per_tensor_sources={},
+                missing=[],
+                target_layout=target_layout,
+                legacy_single_source=True,
+            )
+
+        return SliceCoveragePlan(
+            candidates=candidates,
+            per_tensor_sources=per_tensor_sources,
+            missing=missing,
+            target_layout=target_layout,
+            legacy_single_source=False,
+        )
+
+    @staticmethod
+    def _plan_tensor_slice(
+        *,
+        name: str,
+        candidates: list[V2SourceCandidate],
+        target_layout: "TargetTPLayout",
+    ) -> "_TensorPlan":
+        # Find every (candidate, td) pair publishing this tensor.
+        published: list[tuple[V2SourceCandidate, TensorDescriptorV2]] = []
+        for cand in candidates:
+            if not cand.registry:
+                continue
+            for td in cand.registry.get("tensors", []):
+                if isinstance(td, TensorDescriptorV2) and td.name == name:
+                    published.append((cand, td))
+                    break
+        if not published:
+            return _TensorPlan(contributions=[], reason="no publishers")
+
+        # All publishers must agree on global shape + dtype + placement kind.
+        first_td = published[0][1]
+        for _, td in published[1:]:
+            if td.global_shape != first_td.global_shape:
+                return _TensorPlan(
+                    contributions=[],
+                    reason=f"shape disagreement {first_td.global_shape} vs {td.global_shape}",
+                )
+
+        if first_td.placement_kind == "REPLICATE":
+            # Any candidate satisfies. Caller's already sorted candidates by
+            # freshness in discover_v2_sources.
+            cand, td = published[0]
+            return _TensorPlan(
+                contributions=[
+                    SliceSource(
+                        candidate=cand,
+                        tensor_name=name,
+                        src_range=(0, first_td.global_shape[0])
+                        if first_td.global_shape
+                        else (0, 0),
+                        dst_range=(0, first_td.global_shape[0])
+                        if first_td.global_shape
+                        else (0, 0),
+                        shard_axis=0,
+                    )
+                ],
+                reason="ok-replicate",
+            )
+
+        if first_td.placement_kind != "SHARD":
+            return _TensorPlan(
+                contributions=[],
+                reason=f"placement_kind={first_td.placement_kind} not supported in v0",
+            )
+
+        if first_td.shard_axis != target_layout.shard_axis:
+            return _TensorPlan(
+                contributions=[],
+                reason=(
+                    f"shard_axis mismatch: publisher={first_td.shard_axis} "
+                    f"target={target_layout.shard_axis}"
+                ),
+            )
+
+        axis_total = first_td.global_shape[target_layout.shard_axis]
+        # Receiver's wanted slice. Even split for v0; uneven splits are
+        # handled by the caller passing a custom ``target_layout`` that
+        # already encodes the start/end pair.
+        if target_layout.target_range is not None:
+            t_start, t_end = target_layout.target_range
+        else:
+            chunk = axis_total // target_layout.world_size
+            t_start = target_layout.rank * chunk
+            t_end = t_start + chunk
+
+        # Walk publishers in freshness order, accumulate intersections.
+        contributions: list[SliceSource] = []
+        covered_until = t_start
+        # Sort by start of local_shard_range so we accumulate left-to-right.
+        published_sorted = sorted(
+            published,
+            key=lambda pair: (
+                pair[1].local_shard_range[0] if pair[1].local_shard_range else 0
+            ),
+        )
+        for cand, td in published_sorted:
+            if td.local_shard_range is None:
+                continue
+            p_start, p_end = td.local_shard_range
+            inter_start = max(p_start, t_start)
+            inter_end = min(p_end, t_end)
+            if inter_start >= inter_end:
+                continue
+            if inter_start > covered_until:
+                # gap — coverage incomplete.
+                return _TensorPlan(
+                    contributions=[],
+                    reason=(
+                        f"coverage gap at axis {target_layout.shard_axis} "
+                        f"[{covered_until}, {inter_start})"
+                    ),
+                )
+            contributions.append(
+                SliceSource(
+                    candidate=cand,
+                    tensor_name=name,
+                    src_range=(inter_start - p_start, inter_end - p_start),
+                    dst_range=(inter_start - t_start, inter_end - t_start),
+                    shard_axis=target_layout.shard_axis,
+                )
+            )
+            covered_until = inter_end
+            if covered_until >= t_end:
+                break
+        if covered_until < t_end:
+            return _TensorPlan(
+                contributions=[],
+                reason=(
+                    f"coverage gap at axis {target_layout.shard_axis} "
+                    f"[{covered_until}, {t_end})"
+                ),
+            )
+        return _TensorPlan(contributions=contributions, reason="ok-shard")
 
     def publish_self_as_source(
         self,

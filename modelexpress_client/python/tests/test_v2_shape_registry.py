@@ -185,3 +185,99 @@ def test_registry_full_round_trip_multitensor(sd):
     assert e.global_shape == (192, 4096, 12288)
     assert e.local_shard_range == (72, 96)
     assert set(e.owned_expert_ids) == {72, 73, 74, 75, 76, 77}
+
+
+# Phase 3a / 3b: compile_target + compile_metadata round-trip.
+
+
+def test_compile_target_default_is_hf_raw(sd):
+    import torch
+
+    t = torch.randn(8, 16, dtype=torch.bfloat16)
+    desc = sd.describe_tensor(name="lm_head.weight", tensor=t, rank=0, fsdp_world_size=1)
+    assert desc.compile_target == sd.COMPILE_TARGET_HF_RAW
+    assert desc.compile_metadata == {}
+
+
+def test_compile_target_round_trip(sd):
+    import torch
+
+    t = torch.randn(8, 16, dtype=torch.bfloat16)
+    desc = sd.describe_tensor(
+        name="model.layers.0.mlp.gate_proj.weight",
+        tensor=t,
+        rank=0,
+        fsdp_world_size=1,
+        compile_target=sd.COMPILE_TARGET_DEEPGEMM_FP8,
+        compile_metadata={"block_size": 128, "scale_layout": "K-major"},
+    )
+    assert desc.compile_target == sd.COMPILE_TARGET_DEEPGEMM_FP8
+    assert desc.compile_metadata == {"block_size": 128, "scale_layout": "K-major"}
+
+    blob = sd.encode_registry([desc], version=7, trainer_world_layout="fsdp:1")
+    parsed = sd.decode_registry(blob)
+    out = parsed["tensors"][0]
+    assert out.compile_target == sd.COMPILE_TARGET_DEEPGEMM_FP8
+    assert out.compile_metadata == {"block_size": 128, "scale_layout": "K-major"}
+
+
+def test_compile_target_omitted_from_wire_when_default(sd):
+    import json
+    import torch
+
+    t = torch.randn(8, 16, dtype=torch.bfloat16)
+    desc = sd.describe_tensor(name="x", tensor=t, rank=0, fsdp_world_size=1)
+    blob = sd.encode_registry([desc], version=1, trainer_world_layout="fsdp:1")
+    obj = json.loads(blob)
+    assert "compile_target" not in obj["tensors"][0]
+    assert "compile_metadata" not in obj["tensors"][0]
+
+
+def test_compile_target_matches_no_filter_is_accept(sd):
+    desc = sd.TensorDescriptorV2(
+        name="w",
+        global_shape=(4,),
+        dtype="bfloat16",
+        compile_target=sd.COMPILE_TARGET_CUTLASS_FP8,
+    )
+    assert sd.compile_target_matches(desc, allowed_targets=None)
+
+
+def test_compile_target_matches_whitelist(sd):
+    desc = sd.TensorDescriptorV2(
+        name="w",
+        global_shape=(4,),
+        dtype="bfloat16",
+        compile_target=sd.COMPILE_TARGET_DEEPGEMM_FP8,
+    )
+    assert sd.compile_target_matches(
+        desc, allowed_targets={sd.COMPILE_TARGET_DEEPGEMM_FP8, sd.COMPILE_TARGET_HF_RAW}
+    )
+    assert not sd.compile_target_matches(
+        desc, allowed_targets={sd.COMPILE_TARGET_CUTLASS_FP8}
+    )
+
+
+def test_compile_target_matches_required_metadata(sd):
+    desc = sd.TensorDescriptorV2(
+        name="w",
+        global_shape=(4,),
+        dtype="bfloat16",
+        compile_target=sd.COMPILE_TARGET_DEEPGEMM_FP8,
+        compile_metadata={"block_size": 128, "scale_layout": "K-major"},
+    )
+    assert sd.compile_target_matches(
+        desc,
+        allowed_targets={sd.COMPILE_TARGET_DEEPGEMM_FP8},
+        required_metadata={"block_size": 128},
+    )
+    assert not sd.compile_target_matches(
+        desc,
+        allowed_targets={sd.COMPILE_TARGET_DEEPGEMM_FP8},
+        required_metadata={"block_size": 256},
+    )
+    assert not sd.compile_target_matches(
+        desc,
+        allowed_targets={sd.COMPILE_TARGET_DEEPGEMM_FP8},
+        required_metadata={"k_split": 4},
+    )

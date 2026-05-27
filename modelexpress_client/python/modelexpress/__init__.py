@@ -76,12 +76,30 @@ from .metadata.heartbeat import HeartbeatThread  # noqa: F401
 from .nemo_rl_v2 import (  # noqa: F401
     MxV2RefitReceiver,
     MxV2TrainingPublisher,
+    SliceCoveragePlan,
+    SliceSource,
+    TargetTPLayout,
     TrainerWorldLayout,
+    V2SourceCandidate,
+)
+from .shape_descriptors import (  # noqa: F401
+    COMPILE_TARGET_CUTLASS_FP8,
+    COMPILE_TARGET_DEEPGEMM_FP8,
+    COMPILE_TARGET_HF_RAW,
+    COMPILE_TARGET_TRTLLM,
+    COMPILE_TARGET_VLLM_FUSED,
+    TensorDescriptorV2,
+    compile_target_matches,
 )
 from .training_publisher import MxTrainingPublisher  # noqa: F401
 from .refit_receiver import MxRefitReceiver  # noqa: F401
 
 __all__ = [
+    "COMPILE_TARGET_CUTLASS_FP8",
+    "COMPILE_TARGET_DEEPGEMM_FP8",
+    "COMPILE_TARGET_HF_RAW",
+    "COMPILE_TARGET_TRTLLM",
+    "COMPILE_TARGET_VLLM_FUSED",
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",
@@ -90,7 +108,13 @@ __all__ = [
     "MxTrainingPublisher",
     "MxV2RefitReceiver",
     "MxV2TrainingPublisher",
+    "SliceCoveragePlan",
+    "SliceSource",
+    "TargetTPLayout",
+    "TensorDescriptorV2",
     "TrainerWorldLayout",
+    "V2SourceCandidate",
+    "compile_target_matches",
     "configure_vllm_logging",
     "register_modelexpress_loaders",
 ]

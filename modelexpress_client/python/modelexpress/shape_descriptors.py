@@ -52,10 +52,21 @@ PLACEMENT_REPLICATE = "REPLICATE"
 PLACEMENT_SHARD = "SHARD"
 PLACEMENT_PARTIAL = "PARTIAL"
 
+# Canonical compile targets. The string set is open — frameworks can introduce
+# new targets without an MX bump — but receivers should treat targets they
+# don't recognise as "do not consume". Always pair a non-HF target with
+# ``compile_metadata`` describing the engine/kernel/quant choices that drive
+# byte-level compatibility.
+COMPILE_TARGET_HF_RAW = "hf_raw"
+COMPILE_TARGET_VLLM_FUSED = "vllm_fused"
+COMPILE_TARGET_DEEPGEMM_FP8 = "deep_gemm_fp8"
+COMPILE_TARGET_CUTLASS_FP8 = "cutlass_fp8"
+COMPILE_TARGET_TRTLLM = "trtllm"
+
 
 @dataclasses.dataclass
 class TensorDescriptorV2:
-    """Per-tensor shape + placement + expert metadata.
+    """Per-tensor shape + placement + expert + compile metadata.
 
     Fields:
         name: tensor's qualified name in ``model.state_dict()``.
@@ -69,6 +80,18 @@ class TensorDescriptorV2:
         is_expert: whether this tensor's leading axis is the MoE expert axis.
         expert_axis: index of the expert axis (only when ``is_expert``).
         owned_expert_ids: expert IDs the publisher's rank owns.
+        compile_target: kernel layout label this tensor's bytes are encoded
+            for. ``"hf_raw"`` is the safe default — the trainer's HF
+            state-dict view, no post-processing. Other publishers may emit
+            ``"deep_gemm_fp8"``, ``"cutlass_fp8"``, ``"vllm_fused"``, etc.
+            Receivers filter on this via
+            :meth:`MxV2RefitReceiver.discover_v2_sources` so they only consume
+            sources whose layout they can decode.
+        compile_metadata: free-form key/value blob describing the specific
+            compile invocation (e.g. ``{"engine": "DeepGemm", "version":
+            "0.1.7", "block_size": 128, "scale_layout": "K-major"}``).
+            Receivers should treat a mismatch on any byte-affecting field as
+            a hard reject even if ``compile_target`` matches.
     """
 
     name: str
@@ -80,6 +103,8 @@ class TensorDescriptorV2:
     is_expert: bool = False
     expert_axis: int = 0
     owned_expert_ids: tuple[int, ...] = ()
+    compile_target: str = COMPILE_TARGET_HF_RAW
+    compile_metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -95,6 +120,10 @@ class TensorDescriptorV2:
             d["is_expert"] = True
             d["expert_axis"] = self.expert_axis
             d["owned_expert_ids"] = list(self.owned_expert_ids)
+        if self.compile_target != COMPILE_TARGET_HF_RAW:
+            d["compile_target"] = self.compile_target
+        if self.compile_metadata:
+            d["compile_metadata"] = dict(self.compile_metadata)
         return d
 
     @classmethod
@@ -110,6 +139,8 @@ class TensorDescriptorV2:
             is_expert=bool(d.get("is_expert", False)),
             expert_axis=int(d.get("expert_axis", 0)),
             owned_expert_ids=tuple(d.get("owned_expert_ids", [])),
+            compile_target=str(d.get("compile_target", COMPILE_TARGET_HF_RAW)),
+            compile_metadata=dict(d.get("compile_metadata", {})),
         )
 
 
@@ -127,6 +158,8 @@ def describe_tensor(
     is_expert: bool = False,
     expert_axis: int = 0,
     owned_expert_ids: tuple[int, ...] | set[int] | list[int] = (),
+    compile_target: str = COMPILE_TARGET_HF_RAW,
+    compile_metadata: dict[str, Any] | None = None,
 ) -> TensorDescriptorV2:
     """Build a ``TensorDescriptorV2`` from a tensor + rank context.
 
@@ -142,6 +175,7 @@ def describe_tensor(
     along ``shard_axis`` that this rank owns.
     """
     dtype_str = _dtype_to_str(tensor.dtype)
+    metadata = dict(compile_metadata) if compile_metadata else {}
     placements = getattr(tensor, "placements", None)
     if not _DTensor_AVAILABLE or not placements:
         return TensorDescriptorV2(
@@ -152,6 +186,8 @@ def describe_tensor(
             is_expert=is_expert,
             expert_axis=expert_axis,
             owned_expert_ids=tuple(sorted(owned_expert_ids)),
+            compile_target=compile_target,
+            compile_metadata=metadata,
         )
 
     if len(placements) != 1:
@@ -172,6 +208,8 @@ def describe_tensor(
             is_expert=is_expert,
             expert_axis=expert_axis,
             owned_expert_ids=tuple(sorted(owned_expert_ids)),
+            compile_target=compile_target,
+            compile_metadata=metadata,
         )
 
     if isinstance(p, Shard):
@@ -213,6 +251,8 @@ def describe_tensor(
             is_expert=is_expert,
             expert_axis=expert_axis,
             owned_expert_ids=tuple(sorted(owned_expert_ids)),
+            compile_target=compile_target,
+            compile_metadata=metadata,
         )
 
     if isinstance(p, Partial):
@@ -222,6 +262,8 @@ def describe_tensor(
             dtype=dtype_str,
             placement_kind=PLACEMENT_PARTIAL,
             shard_axis=int(p.dim) if hasattr(p, "dim") else 0,
+            compile_target=compile_target,
+            compile_metadata=metadata,
         )
 
     raise NotImplementedError(f"unsupported DTensor placement: {p!r}")
@@ -283,11 +325,46 @@ def decode_expert_set(s: str | None) -> set[int]:
     return {int(p) for p in s.split(",") if p.strip()}
 
 
+def compile_target_matches(
+    descriptor: TensorDescriptorV2,
+    *,
+    allowed_targets: set[str] | frozenset[str] | None,
+    required_metadata: dict[str, Any] | None = None,
+) -> bool:
+    """Return True if ``descriptor`` is acceptable to a receiver.
+
+    Args:
+        descriptor: the publisher-side descriptor (its ``compile_target`` and
+            ``compile_metadata`` describe how the bytes are laid out).
+        allowed_targets: receiver-side whitelist of compile-target strings the
+            receiver knows how to consume. ``None`` means "accept everything"
+            (back-compat shim — equivalent to the v0 behaviour).
+        required_metadata: optional key/value subset the descriptor's
+            ``compile_metadata`` must agree with byte-for-byte. Useful for
+            pinning e.g. ``{"block_size": 128, "scale_layout": "K-major"}``
+            so a Cutlass receiver doesn't accept a DeepGemm-block-256
+            publisher's bytes by mistake.
+    """
+    if allowed_targets is not None and descriptor.compile_target not in allowed_targets:
+        return False
+    if required_metadata:
+        for key, want in required_metadata.items():
+            if descriptor.compile_metadata.get(key) != want:
+                return False
+    return True
+
+
 __all__ = [
+    "COMPILE_TARGET_CUTLASS_FP8",
+    "COMPILE_TARGET_DEEPGEMM_FP8",
+    "COMPILE_TARGET_HF_RAW",
+    "COMPILE_TARGET_TRTLLM",
+    "COMPILE_TARGET_VLLM_FUSED",
     "PLACEMENT_PARTIAL",
     "PLACEMENT_REPLICATE",
     "PLACEMENT_SHARD",
     "TensorDescriptorV2",
+    "compile_target_matches",
     "decode_expert_set",
     "decode_registry",
     "describe_tensor",

@@ -57,7 +57,7 @@ from .shape_descriptors import (
     describe_tensor,
     encode_expert_set,
     encode_registry,
-)
+)  # COMPILE_TARGET_HF_RAW is re-exported for callers passing it to add_tensor().
 from .training_publisher import MxTrainingPublisher
 
 logger = logging.getLogger("modelexpress.nemo_rl_v2")
@@ -218,6 +218,8 @@ class MxV2TrainingPublisher:
         is_expert: bool = False,
         expert_axis: int = 0,
         owned_expert_ids: tuple[int, ...] | set[int] | list[int] = (),
+        compile_target: str = COMPILE_TARGET_HF_RAW,
+        compile_metadata: dict[str, object] | None = None,
     ) -> None:
         """Register a tensor for publication.
 
@@ -237,6 +239,19 @@ class MxV2TrainingPublisher:
             expert_axis: axis index for the expert dimension.
             owned_expert_ids: which expert IDs this rank holds. Pass
                 only when ``is_expert == True``.
+            compile_target: Phase-3a tag identifying the kernel layout
+                the bytes are encoded for. Defaults to ``"hf_raw"`` —
+                plain HF state-dict bytes, no kernel-specific layout.
+                Callers should pass the resolved ``ConversionEntry.compile_target``
+                from their conversion registry (e.g. ``"cutlass_fp8"``
+                for cutlass per-channel FP8, ``"deep_gemm_fp8"`` for
+                DeepGemm 128x128 blockwise).
+            compile_metadata: free-form key/value blob describing the
+                byte-affecting compile choices (block size, scale
+                layout, kernel version, etc.). Receivers filter on this
+                via :meth:`MxV2RefitReceiver.discover_v2_sources`
+                ``required_compile_metadata=`` so a Cutlass receiver
+                won't accidentally consume DeepGemm-block-256 bytes.
         """
         if not self._initialized:
             raise RuntimeError("call initialize() before add_tensor()")
@@ -253,6 +268,8 @@ class MxV2TrainingPublisher:
             is_expert=is_expert,
             expert_axis=expert_axis,
             owned_expert_ids=tuple(sorted(owned_expert_ids)),
+            compile_target=compile_target,
+            compile_metadata=compile_metadata,
         )
         self._registry.append(descriptor)
         # Use a key that's unique per descriptor (including any potential

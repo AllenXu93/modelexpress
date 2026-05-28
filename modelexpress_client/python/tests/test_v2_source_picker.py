@@ -924,6 +924,129 @@ def test_phase4_receive_via_plan_single_source_passthrough(v2):
     assert torch.equal(out["w"], r0_buf[512:1024])
 
 
+# ----------------------------------------------------------------------------
+# Phase 3 graduation glue — MxV2TrainingPublisher.add_tensor takes the new
+# compile_target / compile_metadata kwargs and they flow into the registry.
+# ----------------------------------------------------------------------------
+
+
+def test_phase3_add_tensor_threads_compile_target(v2):
+    """add_tensor's new compile_target + compile_metadata kwargs must surface
+    on the resulting TensorDescriptorV2 in the publisher's internal registry."""
+    import torch
+
+    sd = sys.modules["modelexpress.shape_descriptors"]
+
+    # Stand up a publisher pointed at the stub MX client; we won't actually
+    # publish, just inspect the registry after add_tensor calls.
+    pub = v2.MxV2TrainingPublisher(
+        agent_name="t",
+        device_id=0,
+        mx_server_url="x",
+        worker_rank=0,
+        world_layout=v2.TrainerWorldLayout(fsdp_world_size=1),
+        heartbeat=False,
+    )
+    pub.initialize(model_name="m", dtype="bfloat16")
+
+    class _FakeCudaTensor:
+        # Minimal stand-in: ``describe_tensor`` reads .dtype, .shape,
+        # optional .placements; ``add_tensor`` checks .is_cuda.
+        def __init__(self, shape, dtype=torch.bfloat16):
+            self.shape = torch.Size(shape)
+            self.dtype = dtype
+            self.is_cuda = True
+
+    pub.add_tensor(
+        name="lm_head.weight",
+        tensor=_FakeCudaTensor([2048, 4096]),
+    )
+    pub.add_tensor(
+        name="model.layers.0.mlp.gate_proj.weight",
+        tensor=_FakeCudaTensor([512, 2048]),
+        compile_target=sd.COMPILE_TARGET_CUTLASS_FP8,
+        compile_metadata={
+            "dtype": "e4m3",
+            "scale_layout": "per_channel",
+            "scale_axis": -1,
+            "activation_scheme": "dynamic",
+        },
+    )
+    pub.add_tensor(
+        name="model.layers.0.mlp.experts.weight",
+        tensor=_FakeCudaTensor([24, 4096, 12288]),
+        is_expert=True,
+        owned_expert_ids=(0, 1, 2, 3),
+        compile_target=sd.COMPILE_TARGET_DEEPGEMM_FP8,
+        compile_metadata={
+            "dtype": "e4m3",
+            "scale_layout": "blockwise",
+            "block_size": [128, 128],
+        },
+    )
+
+    by_name = {d.name: d for d in pub._registry}
+    assert by_name["lm_head.weight"].compile_target == sd.COMPILE_TARGET_HF_RAW
+    assert by_name["lm_head.weight"].compile_metadata == {}
+
+    gp = by_name["model.layers.0.mlp.gate_proj.weight"]
+    assert gp.compile_target == sd.COMPILE_TARGET_CUTLASS_FP8
+    assert gp.compile_metadata == {
+        "dtype": "e4m3",
+        "scale_layout": "per_channel",
+        "scale_axis": -1,
+        "activation_scheme": "dynamic",
+    }
+
+    ex = by_name["model.layers.0.mlp.experts.weight"]
+    assert ex.compile_target == sd.COMPILE_TARGET_DEEPGEMM_FP8
+    assert ex.compile_metadata == {
+        "dtype": "e4m3",
+        "scale_layout": "blockwise",
+        "block_size": [128, 128],
+    }
+    assert ex.is_expert
+    assert set(ex.owned_expert_ids) == {0, 1, 2, 3}
+
+
+def test_phase3_add_tensor_compile_target_survives_encode_decode(v2):
+    """Round-trip: tagged tensors → encode_registry → decode_registry preserves
+    compile_target + compile_metadata. Asserts the wire format is intact end-to-end."""
+    import torch
+
+    sd = sys.modules["modelexpress.shape_descriptors"]
+    pub = v2.MxV2TrainingPublisher(
+        agent_name="t",
+        device_id=0,
+        mx_server_url="x",
+        worker_rank=0,
+        world_layout=v2.TrainerWorldLayout(fsdp_world_size=1),
+        heartbeat=False,
+    )
+    pub.initialize(model_name="m", dtype="bfloat16")
+
+    class _FakeCudaTensor:
+        def __init__(self, shape, dtype=torch.bfloat16):
+            self.shape = torch.Size(shape)
+            self.dtype = dtype
+            self.is_cuda = True
+
+    pub.add_tensor(
+        name="w",
+        tensor=_FakeCudaTensor([64, 128]),
+        compile_target=sd.COMPILE_TARGET_CUTLASS_FP8,
+        compile_metadata={"dtype": "e4m3", "scale_layout": "per_channel"},
+    )
+
+    blob = sd.encode_registry(
+        pub._registry, version=42, trainer_world_layout="fsdp:1"
+    )
+    parsed = sd.decode_registry(blob)
+    out = parsed["tensors"][0]
+    assert out.compile_target == sd.COMPILE_TARGET_CUTLASS_FP8
+    assert out.compile_metadata == {"dtype": "e4m3", "scale_layout": "per_channel"}
+
+
 def test_phase4_receive_via_plan_rejects_uncovered(v2):
     """receive_via_plan refuses to run a partial plan."""
     sd = sys.modules["modelexpress.shape_descriptors"]

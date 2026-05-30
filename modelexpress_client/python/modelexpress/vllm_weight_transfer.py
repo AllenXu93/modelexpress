@@ -337,7 +337,15 @@ class MxWeightTransferEngine:
                     f"compile_target_filter={update_info.compile_target_filter}, "
                     f"required_compile_metadata={update_info.required_compile_metadata}"
                 )
-            for name, tensor in self._receiver.receive_from(
+            # Scratch path: receiver allocates buffers matching the
+            # publisher's layout, NIXL writes into them, we yield them
+            # for the load_weights callback. This matches Anyscale's
+            # RDT plugin pattern and works without pre-registered
+            # model parameters — the common cold-start case for vLLM
+            # and the only sensible mode for the benchmark harness.
+            # Once vLLM exposes register_destinations, this can switch
+            # to the zero-copy `receive_from` path (design doc §5.1).
+            for name, tensor in self._receiver.receive_from_scratch(
                 chosen, timeout_seconds=update_info.timeout_seconds
             ):
                 load_weights([(name, tensor)])

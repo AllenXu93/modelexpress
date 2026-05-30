@@ -267,7 +267,7 @@ def test_receive_weights_matched_tp_path(vllm_wt, monkeypatch):
     )
     yielded = [("w1", "T1"), ("w2", "T2")]
     monkeypatch.setattr(
-        engine._receiver, "receive_from", lambda c, **kw: iter(yielded)
+        engine._receiver, "receive_from_scratch", lambda c, **kw: iter(yielded)
     )
 
     received = []
@@ -428,7 +428,7 @@ def test_receive_weights_publishes_self_as_replica_when_enabled(vllm_wt, monkeyp
     cand = MagicMock()
     monkeypatch.setattr(engine._receiver, "discover_v2_sources", lambda **kw: [cand])
     monkeypatch.setattr(engine._receiver, "pick_best_source", lambda *a, **kw: cand)
-    monkeypatch.setattr(engine._receiver, "receive_from", lambda *a, **kw: iter([]))
+    monkeypatch.setattr(engine._receiver, "receive_from_scratch", lambda *a, **kw: iter([]))
     publish_calls = []
 
     def fake_publish(*, version, model_name):
@@ -458,7 +458,7 @@ def test_receive_weights_publish_self_failure_is_swallowed(vllm_wt, monkeypatch)
     cand = MagicMock()
     monkeypatch.setattr(engine._receiver, "discover_v2_sources", lambda **kw: [cand])
     monkeypatch.setattr(engine._receiver, "pick_best_source", lambda *a, **kw: cand)
-    monkeypatch.setattr(engine._receiver, "receive_from", lambda *a, **kw: iter([]))
+    monkeypatch.setattr(engine._receiver, "receive_from_scratch", lambda *a, **kw: iter([]))
 
     def broken_publish(*, version, model_name):
         raise RuntimeError("MX server unreachable")

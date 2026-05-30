@@ -861,6 +861,28 @@ class MxV2RefitReceiver:
             candidate.ref, timeout_seconds=timeout_seconds
         )
 
+    def receive_from_scratch(
+        self,
+        candidate: V2SourceCandidate,
+        *,
+        timeout_seconds: float = 300.0,
+        tensor_shapes: dict[str, tuple[int, ...]] | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Pull the candidate's tensors via NIXL into receiver-allocated buffers.
+
+        Wraps :meth:`MxRefitReceiver.receive_weights_scratch`. Use this
+        when the caller has no pre-registered model parameters to
+        receive into — e.g. cold-start in a vLLM worker before
+        ``model.load_weights()``, or the benchmark harness. Yielded
+        tensors are short-lived scratch buffers; copy them out or feed
+        them through ``load_weights`` before the next call.
+        """
+        yield from self._receiver.receive_weights_scratch(
+            candidate.ref,
+            timeout_seconds=timeout_seconds,
+            tensor_shapes=tensor_shapes,
+        )
+
     def receive_via_plan(
         self,
         plan: "SliceCoveragePlan",

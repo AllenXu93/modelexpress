@@ -66,32 +66,26 @@ egress because receivers 2..N pulled from already-loaded peers.
 
 ## Cluster mode (Kubernetes — kavin namespace)
 
-The same script runs unchanged inside any pod that can resolve the MX
-server. The recommended pattern for the cluster is a single
-benchmark job that pins to a known set of GB200 nodes:
+A turnkey Job manifest at `k8s/bench-elastic.yaml` runs all three
+scenarios in sequence and stashes the JSON outputs in `/results/`
+inside the pod. A driver script at `run_cluster_bench.sh` wraps the
+apply + wait + collect cycle:
 
-```yaml
-# benchmarks/k8s/bench-elastic.yaml — to be added in a follow-up commit
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: mx-bench-elastic
-  namespace: kavin
-spec:
-  template:
-    spec:
-      containers:
-        - name: bench
-          image: <prime-rl image with this branch>
-          command: [
-            "python",
-            "/app/.venv/lib/python3.12/site-packages/modelexpress/benchmarks/bench_elastic_scaling.py",
-            "--scenario=elastic_scale",
-            "--num-receivers=4",
-            "--steps=3",
-            "--output=/results/elastic.json"
-          ]
+```bash
+./run_cluster_bench.sh           # runs all 3 scenarios, collects JSON
+./run_cluster_bench.sh --watch   # also tails the pod logs live
 ```
+
+After completion, results land in `./results-<timestamp>/` with one
+JSON file per scenario plus a printed summary. The manifest requests
+5 GPUs (1 trainer + 4 receivers); adjust the `nvidia.com/gpu` request
+in the manifest if your namespace has different quota.
+
+The image is pinned to `nvcr.io/nvidian/prime-rl:v0.5.2` in the
+manifest by default; update the tag if you want a different
+modelexpress build. The harness lives at
+`modelexpress/benchmarks/bench_elastic_scaling.py` inside any image
+that has this branch's modelexpress install.
 
 ## Output schema
 

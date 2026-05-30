@@ -92,7 +92,7 @@ from .shape_descriptors import (  # noqa: F401
     compile_target_matches,
 )
 from .training_publisher import MxTrainingPublisher  # noqa: F401
-from .refit_receiver import MxRefitReceiver  # noqa: F401
+from .refit_receiver import MxRefitReceiver, TransferStats  # noqa: F401
 
 __all__ = [
     "COMPILE_TARGET_CUTLASS_FP8",
@@ -113,6 +113,7 @@ __all__ = [
     "TargetTPLayout",
     "TensorDescriptorV2",
     "TrainerWorldLayout",
+    "TransferStats",
     "V2SourceCandidate",
     "compile_target_matches",
     "configure_vllm_logging",

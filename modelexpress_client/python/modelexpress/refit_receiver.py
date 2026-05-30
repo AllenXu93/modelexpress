@@ -59,6 +59,58 @@ class SourceRef:
     training_step: int
 
 
+@dataclass
+class TransferStats:
+    """Structured per-receive metrics. Populated after each receive_weights*
+    call and exposed on ``MxRefitReceiver.last_stats`` so benchmarks and
+    operators can query timing/throughput without parsing log lines.
+
+    Fields:
+        bytes_received: total bytes pulled via NIXL RDMA in this call.
+            Excludes the v2 sidecar (`__mx_v2_meta__`) since that is
+            filtered out before RDMA register.
+        bytes_skipped: bytes deliberately skipped by NIXL (e.g. tensors
+            with mismatched destination buffers).
+        tensors_received: count of real tensors (sidecars excluded).
+        elapsed_seconds: wall time of the underlying NIXL transfer.
+            Does NOT include discovery latency (catalog GetMetadata).
+        bandwidth_gbps: derived (``bytes_received * 8 / elapsed / 1e9``).
+            ``0.0`` when elapsed is 0.
+        discovery_seconds: wall time of MX-server discovery + metadata
+            fetch (catalog round-trip). Tracked separately from the
+            RDMA transfer so callers can compare control-plane vs
+            data-plane latencies — important for elastic-scale-up.
+        path: which receive path was used. One of:
+            ``"pre_registered"`` (receive_weights), ``"scratch"``
+            (receive_weights_scratch), ``"from_metadata"``
+            (receive_weights_from_metadata).
+        training_step: the source's training step (== version), echoed
+            back for log/dashboard joins.
+        source_worker_rank: which publisher rank the bytes came from.
+            For multi-source `receive_via_plan` this is None on the
+            aggregate stats and populated on the per-contribution
+            inner stats.
+    """
+
+    bytes_received: int = 0
+    bytes_skipped: int = 0
+    tensors_received: int = 0
+    elapsed_seconds: float = 0.0
+    bandwidth_gbps: float = 0.0
+    discovery_seconds: float = 0.0
+    path: str = ""
+    training_step: int = 0
+    source_worker_rank: int | None = None
+
+    def update_bandwidth(self) -> None:
+        """Recompute bandwidth from bytes_received + elapsed_seconds."""
+        self.bandwidth_gbps = (
+            (self.bytes_received * 8) / (self.elapsed_seconds * 1e9)
+            if self.elapsed_seconds > 0
+            else 0.0
+        )
+
+
 class MxRefitReceiver:
     """Receives updated weights from a training process via ModelExpress RDMA.
 
@@ -84,6 +136,12 @@ class MxRefitReceiver:
         self._device_id = device_id
         self._mx_server_url = mx_server_url
         self._listen_port = listen_port
+
+        # Last-call metrics; populated after each receive_weights* call.
+        # Callers (benchmarks, dashboards, the v2 wrapper) can read this
+        # after each invocation without parsing logs.
+        self.last_stats: TransferStats = TransferStats()
+        self.history: list[TransferStats] = []  # full per-call history; appended after each call
 
         self._nixl: NixlTransferManager | None = None
         self._client: MxClient | None = None
@@ -251,10 +309,12 @@ class MxRefitReceiver:
         if not self._initialized:
             raise RuntimeError("Call initialize() before receive_weights()")
 
+        discovery_start = time.monotonic()
         meta_resp = self._client.get_metadata(
             mx_source_id=source.mx_source_id,
             worker_id=source.worker_id,
         )
+        discovery_seconds = time.monotonic() - discovery_start
         if not meta_resp.found:
             raise RuntimeError(
                 f"Source {source.mx_source_id}/{source.worker_id} not found on MX Server"
@@ -284,10 +344,24 @@ class MxRefitReceiver:
             timeout_seconds=timeout_seconds,
         )
 
+        stats = TransferStats(
+            bytes_received=transferred,
+            bytes_skipped=skipped,
+            tensors_received=len(source_tensors),
+            elapsed_seconds=elapsed,
+            discovery_seconds=discovery_seconds,
+            path="pre_registered",
+            training_step=source.training_step,
+            source_worker_rank=source.worker_rank,
+        )
+        stats.update_bandwidth()
+        self.last_stats = stats
+        self.history.append(stats)
+
         logger.info(
-            f"RDMA transfer complete: {transferred} bytes, "
-            f"{len(source_tensors)} tensors, {elapsed:.2f}s "
-            f"(step={source.training_step})"
+            f"RDMA transfer complete: {transferred / 1e9:.2f} GB, "
+            f"{len(source_tensors)} tensors, {elapsed:.2f}s, "
+            f"{stats.bandwidth_gbps:.1f} Gbps (step={source.training_step})"
         )
 
         self._current_step = source.training_step
@@ -324,10 +398,12 @@ class MxRefitReceiver:
         if not self._initialized:
             raise RuntimeError("Call initialize() before receive_weights_scratch()")
 
+        discovery_start = time.monotonic()
         meta_resp = self._client.get_metadata(
             mx_source_id=source.mx_source_id,
             worker_id=source.worker_id,
         )
+        discovery_seconds = time.monotonic() - discovery_start
         if not meta_resp.found:
             raise RuntimeError(
                 f"Source {source.mx_source_id}/{source.worker_id} not found on MX Server"
@@ -375,11 +451,24 @@ class MxRefitReceiver:
             timeout_seconds=timeout_seconds,
         )
 
-        bandwidth_gbps = (transferred * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
+        stats = TransferStats(
+            bytes_received=transferred,
+            bytes_skipped=skipped,
+            tensors_received=len(source_tensors),
+            elapsed_seconds=elapsed,
+            discovery_seconds=discovery_seconds,
+            path="scratch",
+            training_step=source.training_step,
+            source_worker_rank=source.worker_rank,
+        )
+        stats.update_bandwidth()
+        self.last_stats = stats
+        self.history.append(stats)
+
         logger.info(
             f"RDMA transfer complete: {transferred / 1e9:.2f} GB, "
             f"{len(source_tensors)} tensors, {elapsed:.2f}s, "
-            f"{bandwidth_gbps:.1f} Gbps (step={source.training_step})"
+            f"{stats.bandwidth_gbps:.1f} Gbps (step={source.training_step})"
         )
 
         self._current_step = source.training_step
@@ -410,9 +499,24 @@ class MxRefitReceiver:
             timeout_seconds=timeout_seconds,
         )
 
+        stats = TransferStats(
+            bytes_received=transferred,
+            bytes_skipped=skipped,
+            tensors_received=len(source_tensors),
+            elapsed_seconds=elapsed,
+            discovery_seconds=0.0,  # bypass-mode: no catalog roundtrip
+            path="from_metadata",
+            training_step=training_step,
+            source_worker_rank=None,  # not derivable from raw metadata
+        )
+        stats.update_bandwidth()
+        self.last_stats = stats
+        self.history.append(stats)
+
         logger.info(
-            f"RDMA transfer (direct metadata): {transferred} bytes, "
-            f"{len(source_tensors)} tensors, {elapsed:.2f}s"
+            f"RDMA transfer (direct metadata): {transferred / 1e9:.2f} GB, "
+            f"{len(source_tensors)} tensors, {elapsed:.2f}s, "
+            f"{stats.bandwidth_gbps:.1f} Gbps"
         )
 
         self._current_step = training_step

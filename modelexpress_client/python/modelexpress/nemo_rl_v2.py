@@ -555,6 +555,13 @@ class MxV2RefitReceiver:
         self._initialized = False
         self._registered_buffers: dict[str, torch.Tensor] = {}
 
+        # Metrics surface for benchmarks / dashboards. Discovery numbers
+        # are at the v2 layer (catalog walk + per-instance get_metadata);
+        # the per-transfer RDMA numbers live on the wrapped MxRefitReceiver
+        # in `self._receiver.last_stats` and `self._receiver.history`.
+        self._last_discovery_seconds: float = 0.0
+        self._last_discovery_candidates: int = 0
+
     @property
     def worker_rank(self) -> int:
         return self._worker_rank
@@ -614,6 +621,11 @@ class MxV2RefitReceiver:
         if not self._initialized:
             raise RuntimeError("call initialize() before discover_v2_sources()")
 
+        # Track catalog discovery time on the underlying receiver's metrics
+        # so benchmarks can see control-plane latency vs RDMA latency.
+        import time as _time
+        discovery_start = _time.monotonic()
+
         client = self._receiver._client
         assert client is not None, "_receiver._client must be set after initialize()"
         try:
@@ -622,6 +634,7 @@ class MxV2RefitReceiver:
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("list_sources failed: %s", e)
+            self._last_discovery_seconds = _time.monotonic() - discovery_start
             return []
 
         candidates: list[V2SourceCandidate] = []
@@ -799,6 +812,8 @@ class MxV2RefitReceiver:
                 -c.updated_at,
             )
         )
+        self._last_discovery_seconds = _time.monotonic() - discovery_start
+        self._last_discovery_candidates = len(candidates)
         return candidates
 
     def pick_best_source(

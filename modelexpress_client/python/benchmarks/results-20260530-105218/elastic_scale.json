@@ -1,0 +1,170 @@
+{
+  "scenario": "elastic_scale",
+  "config": {
+    "scenario": "elastic_scale",
+    "mode": "live",
+    "mx_server_url": "modelexpress-server.kavin.svc.cluster.local:8001",
+    "model_name": "bench/synthetic-1.5B",
+    "num_receivers": 3,
+    "num_tensors": 64,
+    "tensor_bytes": 8388608,
+    "steps": 3,
+    "step_interval": 3.0,
+    "join_interval": 2.0,
+    "trainer_warmup": 4.0,
+    "poll_interval": 0.5,
+    "cycle_timeout": 60.0,
+    "deadline": 180.0,
+    "trainer_compile_target": "cutlass_fp8",
+    "trainer_device_id": 0,
+    "receiver_device_base": 1,
+    "tmpdir": "/tmp/mx_bench",
+    "output": "/results/elastic_scale.json",
+    "verbose": false
+  },
+  "started_at": 1780163313.3450572,
+  "finished_at": 1780163333.4426496,
+  "wall_seconds": 20.0975923538208,
+  "trainer": {
+    "worker_id": "607c2548-47ff-4874-a7e1-32a304d72678",
+    "mx_source_id": null,
+    "started_at": 1780163317.7837765,
+    "published_versions": [
+      1,
+      2,
+      3
+    ],
+    "compile_target": "cutlass_fp8",
+    "total_published_bytes": 1610612736
+  },
+  "receivers": [
+    {
+      "receiver_id": "recv-0",
+      "worker_rank": 0,
+      "started_at": 1780163319.1701412,
+      "first_receive_at": 1780163320.9977608,
+      "join_latency_seconds": 1.8276195526123047,
+      "compile_target_filter": null,
+      "cycles": [
+        {
+          "version": 1,
+          "bytes_received": 536870912,
+          "tensors_received": 64,
+          "rdma_seconds": 0.01573968108277768,
+          "bandwidth_gbps": 272.87511566543384,
+          "discovery_seconds": 0.15930801001377404,
+          "source_worker_rank": 0,
+          "error": null
+        },
+        {
+          "version": 2,
+          "bytes_received": 536870912,
+          "tensors_received": 64,
+          "rdma_seconds": 0.0019249289762228727,
+          "bandwidth_gbps": 2231.234164508062,
+          "discovery_seconds": 0.1250727119622752,
+          "source_worker_rank": 0,
+          "error": null
+        },
+        {
+          "version": 3,
+          "bytes_received": 0,
+          "tensors_received": 0,
+          "rdma_seconds": 0.0,
+          "bandwidth_gbps": 0.0,
+          "discovery_seconds": 0.0,
+          "source_worker_rank": null,
+          "error": "nixlNotAllowedError: NIXL_ERR_NOT_ALLOWED"
+        }
+      ]
+    },
+    {
+      "receiver_id": "recv-1",
+      "worker_rank": 0,
+      "started_at": 1780163321.3732457,
+      "first_receive_at": 1780163323.2475555,
+      "join_latency_seconds": 1.874309778213501,
+      "compile_target_filter": null,
+      "cycles": [
+        {
+          "version": 1,
+          "bytes_received": 536870912,
+          "tensors_received": 64,
+          "rdma_seconds": 0.08665334992110729,
+          "bandwidth_gbps": 49.56493084122324,
+          "discovery_seconds": 0.15741821797564626,
+          "source_worker_rank": 0,
+          "error": null
+        },
+        {
+          "version": 2,
+          "bytes_received": 536870912,
+          "tensors_received": 64,
+          "rdma_seconds": 0.0020190089708194137,
+          "bandwidth_gbps": 2127.265088008445,
+          "discovery_seconds": 0.14340135303791612,
+          "source_worker_rank": 0,
+          "error": null
+        },
+        {
+          "version": 3,
+          "bytes_received": 536870912,
+          "tensors_received": 64,
+          "rdma_seconds": 0.002593887969851494,
+          "bandwidth_gbps": 1655.8029282374507,
+          "discovery_seconds": 0.14814176899380982,
+          "source_worker_rank": 0,
+          "error": null
+        }
+      ]
+    },
+    {
+      "receiver_id": "recv-2",
+      "worker_rank": 0,
+      "started_at": 1780163323.752439,
+      "first_receive_at": 1780163325.5534651,
+      "join_latency_seconds": 1.8010261058807373,
+      "compile_target_filter": null,
+      "cycles": [
+        {
+          "version": 1,
+          "bytes_received": 536870912,
+          "tensors_received": 64,
+          "rdma_seconds": 0.01696902501862496,
+          "bandwidth_gbps": 253.10630936579471,
+          "discovery_seconds": 0.15842577000148594,
+          "source_worker_rank": 0,
+          "error": null
+        },
+        {
+          "version": 2,
+          "bytes_received": 536870912,
+          "tensors_received": 64,
+          "rdma_seconds": 0.0020005760015919805,
+          "bandwidth_gbps": 2146.8653490705838,
+          "discovery_seconds": 0.1472154010552913,
+          "source_worker_rank": 0,
+          "error": null
+        },
+        {
+          "version": 3,
+          "bytes_received": 536870912,
+          "tensors_received": 64,
+          "rdma_seconds": 0.0018786239670589566,
+          "bandwidth_gbps": 2286.2304385075545,
+          "discovery_seconds": 0.14002183300908655,
+          "source_worker_rank": 0,
+          "error": null
+        }
+      ]
+    }
+  ],
+  "derived": {
+    "trainer_egress_bytes": 4294967296,
+    "total_delivered_bytes": 4294967296,
+    "scenario_specific": {
+      "join_latency_p50": 1.8276195526123047,
+      "join_latency_p99": 1.874309778213501
+    }
+  }
+}

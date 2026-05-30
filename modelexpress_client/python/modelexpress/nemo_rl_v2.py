@@ -45,7 +45,15 @@ from typing import Iterator
 import torch
 
 from . import p2p_pb2
-from .metadata.heartbeat import HeartbeatThread
+try:
+    # Modern modelexpress layout (post-v0.6 / post-PR-#349): heartbeat
+    # lives under a metadata sub-package.
+    from .metadata.heartbeat import HeartbeatThread
+except ImportError:
+    # Older modelexpress layout (v0.5.x, the prime-rl-mx-on-nixl image
+    # in use during the post-#2389 cluster work): heartbeat is at the
+    # package root. Same class, different import path.
+    from .heartbeat import HeartbeatThread
 from .refit_receiver import MxRefitReceiver, SourceRef
 from .shape_descriptors import (
     COMPILE_TARGET_HF_RAW,

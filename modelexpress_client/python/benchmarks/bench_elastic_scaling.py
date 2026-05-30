@@ -403,6 +403,7 @@ def _run_receiver(
     for v in target_versions:
         cycle = ReceiverCycleResult(version=v)
         # Poll until a candidate source is observable.
+        nixl_retry_budget = 2  # NIXL_ERR_NOT_ALLOWED is often transient at first connect
         while time.monotonic() < deadline:
             try:
                 engine.receive_weights(
@@ -448,6 +449,22 @@ def _run_receiver(
                     break
                 # Otherwise the source isn't published yet — poll again.
                 time.sleep(poll_interval_s)
+            except Exception as e:  # noqa: BLE001
+                # NIXL_ERR_NOT_ALLOWED and similar transient connection-setup
+                # errors. Record + retry a couple of times before giving up,
+                # so one receiver's flake doesn't tank the whole scenario.
+                msg = f"{type(e).__name__}: {e}"
+                if nixl_retry_budget > 0:
+                    nixl_retry_budget -= 1
+                    logger.warning(
+                        "%s: v=%d transient error (%s); retrying (%d remaining)",
+                        receiver_id, v, msg, nixl_retry_budget,
+                    )
+                    time.sleep(0.5)
+                    continue
+                cycle.error = msg
+                logger.warning("%s: v=%d failed after retries: %s", receiver_id, v, msg)
+                break
         else:
             cycle.error = "deadline exceeded"
         result.cycles.append(cycle)
@@ -467,12 +484,33 @@ def _spawn(target, kwargs: dict[str, Any]) -> mp.Process:
     return p
 
 
-def _load_result(path: str, cls):
+def _load_result(path: str, cls, fallback_id: str | None = None):
+    """Load a per-subprocess result file. If the file is missing (because
+    the subprocess crashed before writing it), synthesize a placeholder
+    so the scenario as a whole still produces a JSON summary."""
+    if not os.path.exists(path):
+        logger.warning("result file missing: %s (subprocess likely crashed)", path)
+        if cls is TrainerResult:
+            return TrainerResult(
+                worker_id=None,
+                mx_source_id=None,
+                started_at=0.0,
+                published_versions=[],
+                compile_target=None,
+                total_published_bytes=0,
+            )
+        rid = fallback_id or os.path.splitext(os.path.basename(path))[0]
+        return ReceiverResult(
+            receiver_id=rid,
+            worker_rank=-1,
+            started_at=0.0,
+            cycles=[ReceiverCycleResult(version=-1, error="subprocess crashed without writing result")],
+        )
+
     with open(path) as f:
         d = json.load(f)
     if cls is TrainerResult:
         return TrainerResult(**d)
-    # ReceiverResult — rehydrate nested cycles
     cycles = [ReceiverCycleResult(**c) for c in d.pop("cycles", [])]
     return ReceiverResult(cycles=cycles, **d)
 
@@ -489,6 +527,7 @@ def run_elastic_scale(args: argparse.Namespace) -> BenchResult:
     started = time.time()
 
     trainer_path = os.path.join(tmpdir, "trainer.json")
+    trainer_device = args.trainer_device_id
     trainer_proc = _spawn(
         _run_trainer,
         dict(
@@ -500,7 +539,7 @@ def run_elastic_scale(args: argparse.Namespace) -> BenchResult:
             steps=args.steps,
             step_interval_s=args.step_interval,
             compile_target=args.trainer_compile_target,
-            device_id=0,
+            device_id=trainer_device,
             result_path=trainer_path,
         ),
     )
@@ -511,6 +550,7 @@ def run_elastic_scale(args: argparse.Namespace) -> BenchResult:
     for i in range(args.num_receivers):
         rid = f"recv-{i}"
         rpath = os.path.join(tmpdir, f"{rid}.json")
+        receiver_device = args.receiver_device_base + i
         receiver_procs.append(
             (
                 rpath,
@@ -521,7 +561,7 @@ def run_elastic_scale(args: argparse.Namespace) -> BenchResult:
                         worker_rank=0,  # same-rank pull
                         mx_server_url=args.mx_server_url,
                         model_name=args.model_name,
-                        device_id=0,
+                        device_id=receiver_device,
                         listen_port=None,
                         compile_target_filter=None,
                         target_versions=target_versions,
@@ -542,7 +582,10 @@ def run_elastic_scale(args: argparse.Namespace) -> BenchResult:
     finished = time.time()
 
     trainer_result = _load_result(trainer_path, TrainerResult)
-    receivers = [_load_result(rp, ReceiverResult) for rp, _ in receiver_procs]
+    receivers = [
+        _load_result(rp, ReceiverResult, fallback_id=os.path.splitext(os.path.basename(rp))[0])
+        for rp, _ in receiver_procs
+    ]
     return BenchResult(
         scenario="elastic_scale",
         config=vars(args),
@@ -572,20 +615,20 @@ def run_compile_target(args: argparse.Namespace) -> BenchResult:
             steps=args.steps,
             step_interval_s=args.step_interval,
             compile_target=args.trainer_compile_target,  # e.g. "cutlass_fp8"
-            device_id=0,
+            device_id=args.trainer_device_id,
             result_path=trainer_path,
         ),
     )
     time.sleep(args.trainer_warmup)
 
-    # Three receivers running concurrently
+    # Three receivers running concurrently — distinct GPUs.
     scenarios = [
         ("recv-match", [args.trainer_compile_target]),
         ("recv-mismatch", ["deep_gemm_fp8"]),
         ("recv-no-filter", None),
     ]
     procs = []
-    for rid, filt in scenarios:
+    for i, (rid, filt) in enumerate(scenarios):
         rpath = os.path.join(tmpdir, f"{rid}.json")
         procs.append(
             (
@@ -597,7 +640,7 @@ def run_compile_target(args: argparse.Namespace) -> BenchResult:
                         worker_rank=0,
                         mx_server_url=args.mx_server_url,
                         model_name=args.model_name,
-                        device_id=0,
+                        device_id=args.receiver_device_base + i,
                         listen_port=None,
                         compile_target_filter=filt,
                         target_versions=[1],  # one cycle is enough to demo
@@ -620,7 +663,10 @@ def run_compile_target(args: argparse.Namespace) -> BenchResult:
         scenario="compile_target",
         config=vars(args),
         trainer=_load_result(trainer_path, TrainerResult),
-        receivers=[_load_result(rp, ReceiverResult) for rp, _ in procs],
+        receivers=[
+            _load_result(rp, ReceiverResult, fallback_id=os.path.splitext(os.path.basename(rp))[0])
+            for rp, _ in procs
+        ],
         started_at=started,
         finished_at=finished,
     )
@@ -648,7 +694,7 @@ def run_tree_fanout(args: argparse.Namespace) -> BenchResult:
             steps=args.steps,
             step_interval_s=args.step_interval,
             compile_target=args.trainer_compile_target,
-            device_id=0,
+            device_id=args.trainer_device_id,
             result_path=trainer_path,
         ),
     )
@@ -669,7 +715,7 @@ def run_tree_fanout(args: argparse.Namespace) -> BenchResult:
                         worker_rank=0,
                         mx_server_url=args.mx_server_url,
                         model_name=args.model_name,
-                        device_id=0,
+                        device_id=args.receiver_device_base + i,
                         listen_port=None,
                         compile_target_filter=None,
                         target_versions=target_versions,
@@ -693,7 +739,10 @@ def run_tree_fanout(args: argparse.Namespace) -> BenchResult:
         scenario="tree_fanout",
         config=vars(args),
         trainer=_load_result(trainer_path, TrainerResult),
-        receivers=[_load_result(rp, ReceiverResult) for rp, _ in procs],
+        receivers=[
+            _load_result(rp, ReceiverResult, fallback_id=os.path.splitext(os.path.basename(rp))[0])
+            for rp, _ in procs
+        ],
         started_at=started,
         finished_at=finished,
     )
@@ -792,6 +841,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cycle-timeout", type=float, default=60.0)
     p.add_argument("--deadline", type=float, default=180.0)
     p.add_argument("--trainer-compile-target", default="cutlass_fp8")
+    p.add_argument("--trainer-device-id", type=int, default=0,
+                   help="CUDA device for the trainer subprocess.")
+    p.add_argument("--receiver-device-base", type=int, default=1,
+                   help="CUDA device for receiver-0; receiver-i gets device_base+i. "
+                        "With 5 GPUs visible and default trainer=0, receivers use 1..4.")
     p.add_argument("--tmpdir", default="/tmp/mx_bench")
     p.add_argument("--output", default=None, help="If set, also write JSON results to this path.")
     p.add_argument("-v", "--verbose", action="store_true")

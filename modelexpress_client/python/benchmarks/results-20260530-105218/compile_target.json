@@ -1,0 +1,116 @@
+{
+  "scenario": "compile_target",
+  "config": {
+    "scenario": "compile_target",
+    "mode": "live",
+    "mx_server_url": "modelexpress-server.kavin.svc.cluster.local:8001",
+    "model_name": "bench/synthetic-1.5B",
+    "num_receivers": 3,
+    "num_tensors": 16,
+    "tensor_bytes": 4194304,
+    "steps": 2,
+    "step_interval": 2.0,
+    "join_interval": 2.0,
+    "trainer_warmup": 4.0,
+    "poll_interval": 0.5,
+    "cycle_timeout": 60.0,
+    "deadline": 120.0,
+    "trainer_compile_target": "cutlass_fp8",
+    "trainer_device_id": 0,
+    "receiver_device_base": 1,
+    "tmpdir": "/tmp/mx_bench",
+    "output": "/results/compile_target.json",
+    "verbose": false
+  },
+  "started_at": 1780163333.656923,
+  "finished_at": 1780163345.745503,
+  "wall_seconds": 12.088579893112183,
+  "trainer": {
+    "worker_id": "835b0dd8-d81f-4b55-8ce9-5c40938c2cba",
+    "mx_source_id": null,
+    "started_at": 1780163338.1111088,
+    "published_versions": [
+      1,
+      2
+    ],
+    "compile_target": "cutlass_fp8",
+    "total_published_bytes": 134217728
+  },
+  "receivers": [
+    {
+      "receiver_id": "recv-match",
+      "worker_rank": 0,
+      "started_at": 1780163339.5368922,
+      "first_receive_at": 1780163341.8330705,
+      "join_latency_seconds": 2.2961783409118652,
+      "compile_target_filter": [
+        "cutlass_fp8"
+      ],
+      "cycles": [
+        {
+          "version": 1,
+          "bytes_received": 67108864,
+          "tensors_received": 16,
+          "rdma_seconds": 0.02732409699819982,
+          "bandwidth_gbps": 19.64825816697146,
+          "discovery_seconds": 0.16378250601701438,
+          "source_worker_rank": 0,
+          "error": null
+        }
+      ]
+    },
+    {
+      "receiver_id": "recv-mismatch",
+      "worker_rank": 0,
+      "started_at": 1780163339.5368285,
+      "first_receive_at": null,
+      "join_latency_seconds": null,
+      "compile_target_filter": [
+        "deep_gemm_fp8"
+      ],
+      "cycles": [
+        {
+          "version": 1,
+          "bytes_received": 0,
+          "tensors_received": 0,
+          "rdma_seconds": 0.0,
+          "bandwidth_gbps": 0.0,
+          "discovery_seconds": 0.0,
+          "source_worker_rank": null,
+          "error": "MxWeightTransferEngine: no source matches filters for version=1; compile_target_filter={'deep_gemm_fp8'}, required_compile_metadata=None"
+        }
+      ]
+    },
+    {
+      "receiver_id": "recv-no-filter",
+      "worker_rank": 0,
+      "started_at": 1780163339.5369508,
+      "first_receive_at": 1780163341.8330848,
+      "join_latency_seconds": 2.2961339950561523,
+      "compile_target_filter": null,
+      "cycles": [
+        {
+          "version": 1,
+          "bytes_received": 67108864,
+          "tensors_received": 16,
+          "rdma_seconds": 0.02794956904835999,
+          "bandwidth_gbps": 19.208557780303316,
+          "discovery_seconds": 0.16411968995817006,
+          "source_worker_rank": 0,
+          "error": null
+        }
+      ]
+    }
+  ],
+  "derived": {
+    "trainer_egress_bytes": 134217728,
+    "total_delivered_bytes": 134217728,
+    "scenario_specific": {
+      "verdicts": {
+        "recv-match": "accepted",
+        "recv-mismatch": "rejected",
+        "recv-no-filter": "accepted"
+      }
+    }
+  }
+}

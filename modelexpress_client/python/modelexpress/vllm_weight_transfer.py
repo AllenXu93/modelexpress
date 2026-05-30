@@ -291,15 +291,18 @@ class MxWeightTransferEngine:
             )
 
         # Lazy initialize: the v2 receiver needs to be initialize()'d
-        # exactly once. We pass an empty model_tensors map because the
-        # current v0 of this adapter uses the scratch-buffer path (it
-        # writes into receiver-allocated buffers, then yields them for
-        # vLLM's load_weights to consume — matching RDT's pattern).
-        # When the upstream API gets a register_destinations hook
-        # (proposed extension, see design doc §5.1), this is where we
-        # pre-register vLLM's named_parameters for zero-copy receive.
+        # exactly once. We pass model_tensors=None because the current
+        # v0 of this adapter uses the scratch-buffer path (it writes
+        # into receiver-allocated buffers, then yields them for vLLM's
+        # load_weights to consume — matching RDT's pattern).
+        # ``None`` (not ``{}``) is the correct sentinel: NixlTransferManager
+        # rejects empty descriptor lists, but ``MxRefitReceiver.initialize``
+        # treats None as "skip register_memory; caller will register
+        # per-receive". When the upstream API gets a register_destinations
+        # hook (proposed extension, see design doc §5.1), this is where
+        # we'd pre-register vLLM's named_parameters for zero-copy receive.
         if not self._receiver._initialized:
-            self._receiver.initialize(model_tensors={})
+            self._receiver.initialize(model_tensors=None)
 
         # ----- Phase 4 path: mixed-TP / multi-source -----
         if update_info.target_tp_layout is not None:
